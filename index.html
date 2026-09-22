@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Control PID de velocidad</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root{ --bg:#EEF1F4; --card:#FFFFFF; --ink:#1B2733; --muted:#64748B; --line:#DDE3E9;
+         --rpm:#0A7C86; --sp:#E07A10; --ok:#1E8E4E; --bad:#C23B2B; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 "Segoe UI",Roboto,Arial,sans-serif}
+  main{max-width:1000px;margin:0 auto;padding:20px 16px}
+  header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:16px}
+  h1{font-size:1.3rem;margin:0;font-weight:600}
+  .estado{display:flex;align-items:center;gap:8px;font-size:.9rem;color:var(--muted)}
+  .led{width:10px;height:10px;border-radius:50%;background:var(--bad)}
+  .led.on{background:var(--ok)}
+
+  .tarjetas{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 18px}
+  .card .k{font-size:.9rem;color:var(--muted)}
+  .card .v{font-size:2.4rem;font-weight:300;font-variant-numeric:tabular-nums}
+  .card .v small{font-size:1rem;color:var(--muted);margin-left:4px}
+  .rpm .v{color:var(--rpm)} .sp .v{color:var(--sp)}
+
+  .control{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px}
+  .control label{color:var(--muted)}
+  input{font:inherit;font-size:1.05rem;width:110px;padding:8px 10px;border:1px solid var(--line);border-radius:8px}
+  button{font:inherit;padding:9px 16px;border:0;border-radius:8px;background:var(--sp);color:#fff;font-weight:600;cursor:pointer}
+  button:hover{filter:brightness(1.08)}
+  #msg{font-size:.9rem}
+
+  .grafica{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-top:12px}
+  .grafica h2{font-size:1rem;margin:0 0 8px;font-weight:600;display:flex;justify-content:space-between}
+  .grafica h2 a{font-size:.9rem;font-weight:400;color:var(--rpm)}
+  .lienzo{position:relative;height:320px}
+  .lienzo.chico{height:150px}
+
+  footer{margin-top:10px;color:var(--muted);font-size:.85rem;display:flex;gap:20px;flex-wrap:wrap}
+  @media (max-width:640px){ .tarjetas{grid-template-columns:1fr 1fr} .card.err{grid-column:1/-1} .card .v{font-size:2rem} }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Control PID de velocidad · motor DC</h1>
+    <div class="estado"><span id="led" class="led"></span><span id="txt">Esperando al ESP32</span></div>
+  </header>
+
+  <div class="tarjetas">
+    <div class="card rpm"><div class="k">Velocidad</div><div class="v"><span id="vRpm">--</span><small>RPM</small></div></div>
+    <div class="card sp"><div class="k">Setpoint</div><div class="v"><span id="vSp">--</span><small>RPM</small></div></div>
+    <div class="card err"><div class="k">Error</div><div class="v"><span id="vErr">--</span><small>RPM</small></div></div>
+  </div>
+
+  <div class="control">
+    <label for="nuevoSp">Nuevo setpoint ({{ sp_min|int }} a {{ sp_max|int }} RPM):</label>
+    <input id="nuevoSp" type="number" step="any" min="{{ sp_min }}" max="{{ sp_max }}">
+    <button id="btnSp">Aplicar</button>
+    <span id="msg"></span>
+  </div>
+
+  <div class="grafica">
+    <h2>Últimos 5 minutos <a href="/api/exportar.csv">Descargar CSV</a></h2>
+    <div class="lienzo"><canvas id="g1"></canvas></div>
+  </div>
+  <div class="grafica">
+    <h2>Acción de control (PWM)</h2>
+    <div class="lienzo chico"><canvas id="g2"></canvas></div>
+  </div>
+
+  <footer>
+    <span>PWM actual: <b id="vPwm">--</b></span>
+    <span>Registros en BD: <b id="vTotal">0</b></span>
+    <span>Última muestra: <b id="vHora">--</b></span>
+  </footer>
+</main>
+
+<script>
+const VENTANA = {{ ventana }};
+const $ = id => document.getElementById(id);
+
+// ---------- Gráficas ----------
+function crear(id, series, tituloY, desdeCero) {
+  return new Chart($(id), {
+    type: "line",
+    data: { datasets: series.map(s => ({
+      label: s.nombre, data: [], borderColor: s.color, backgroundColor: s.color,
+      borderWidth: 2, pointRadius: 0, borderDash: s.punteada ? [6, 4] : [], stepped: !!s.escalon })) },
+    options: {
+      animation: false, maintainAspectRatio: false, parsing: false,
+      interaction: { mode: "nearest", axis: "x", intersect: false },
+      plugins: { legend: { labels: { boxWidth: 14, boxHeight: 3 } } },
+      scales: {
+        x: { type: "linear", min: -VENTANA, max: 0, ticks: { callback: v => v === 0 ? "ahora" : v + " s" } },
+        y: { beginAtZero: desdeCero, title: { display: true, text: tituloY } }
+      }
+    }
+  });
+}
+const g1 = crear("g1", [
+  { nombre: "Velocidad", color: "#0A7C86" },
+  { nombre: "Setpoint", color: "#E07A10", punteada: true, escalon: true }
+], "RPM", false);
+const g2 = crear("g2", [{ nombre: "PWM", color: "#6C6A9C" }], "PWM", true);
+
+async function historico() {
+  try {
+    const d = await (await fetch("/api/historico")).json();
+    const par = a => d.t.map((t, i) => ({ x: t, y: a[i] }));
+    g1.data.datasets[0].data = par(d.rpm);
+    g1.data.datasets[1].data = par(d.sp);
+    g2.data.datasets[0].data = par(d.pwm);
+    g1.update("none"); g2.update("none");
+  } catch (e) {}
+}
+
+// ---------- Valores actuales ----------
+let spCargado = false;
+async function estado() {
+  try {
+    const e = await (await fetch("/api/estado")).json();
+    const f = (v, d = 1) => v == null ? "--" : v.toFixed(d);
+    $("vRpm").textContent = f(e.rpm);
+    $("vSp").textContent = f(e.setpoint);
+    $("vErr").textContent = f(e.error, 2);
+    $("vPwm").textContent = f(e.pwm, 0);
+    $("vTotal").textContent = e.total;
+    $("vHora").textContent = e.hora ?? "--";
+    $("led").classList.toggle("on", e.conectado);
+    $("txt").textContent = e.conectado ? "ESP32 enviando datos" : "Sin datos del ESP32";
+    if (!spCargado && e.setpoint != null) { $("nuevoSp").value = e.setpoint; spCargado = true; }
+  } catch (err) {
+    $("led").classList.remove("on"); $("txt").textContent = "Servidor no responde";
+  }
+}
+
+// ---------- Cambiar setpoint ----------
+async function enviarSp() {
+  const r = await fetch("/api/setpoint", { method: "POST", headers: { "Content-Type": "application/json" },
+                                           body: JSON.stringify({ sp: $("nuevoSp").value }) });
+  const j = await r.json();
+  $("msg").textContent = r.ok ? `Aplicado: ${j.sp} RPM` : j.error;
+  $("msg").style.color = r.ok ? "#1E8E4E" : "#C23B2B";
+  estado();
+}
+$("btnSp").onclick = enviarSp;
+$("nuevoSp").onkeydown = e => { if (e.key === "Enter") enviarSp(); };
+
+estado(); historico();
+setInterval(estado, 500);
+setInterval(historico, 1000);
+</script>
+</body>
+</html>
